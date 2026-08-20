@@ -1,0 +1,63 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function createsVerifiedPhoneProfile(profile) {
+      return request.auth.token.phone_number is string
+        && request.auth.token.phone_number == profile.phoneNumber;
+    }
+
+    function isInviteParticipant(invite) {
+      return signedIn()
+        && (invite.callerUid == request.auth.uid || invite.calleeUid == request.auth.uid);
+    }
+
+    function isCallParticipant(callId) {
+      return exists(/databases/$(database)/documents/callInvites/$(callId))
+        && isInviteParticipant(
+          get(/databases/$(database)/documents/callInvites/$(callId)).data
+        );
+    }
+
+    match /users/{phoneNumber} {
+      // Authenticated users need contact profiles for local address-book matching.
+      // Email addresses and device tokens are deliberately not stored here.
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.normalizedPhoneNumber == phoneNumber
+        && createsVerifiedPhoneProfile(request.resource.data);
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.normalizedPhoneNumber == phoneNumber;
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    match /userDevices/{uid} {
+      allow read, delete: if signedIn() && request.auth.uid == uid;
+      allow create, update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.uid == uid;
+    }
+
+    match /callInvites/{callId} {
+      allow read: if isInviteParticipant(resource.data);
+      // Invite creation and every status transition are performed by
+      // authenticated Cloud Functions. Admin SDK writes bypass these rules.
+      allow create, update, delete: if false;
+    }
+
+    match /calls/{callId} {
+      allow read, create, update, delete: if isCallParticipant(callId);
+
+      match /candidates/{candidateId} {
+        allow read, create, update, delete: if isCallParticipant(callId);
+      }
+    }
+  }
+}

@@ -1,0 +1,14 @@
+.gradle/
+.idea/
+build/
+local.properties
+app/build/
+app/google-services.json
+app/google-services.*.backup.json
+.firebaserc
+.firebaserc.*.backup
+firebase-debug.log
+firebase-debug.*.log
+*service-account*.json
+*.iml
+.DS_Store

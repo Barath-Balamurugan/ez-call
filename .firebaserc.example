@@ -1,0 +1,5 @@
+{
+  "projects": {
+    "default": "YOUR_ONE_TO_ONE_FIREBASE_PROJECT_ID"
+  }
+}

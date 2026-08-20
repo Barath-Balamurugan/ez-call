@@ -1,0 +1,9 @@
+<resources>
+    <color name="app_background">#353535</color>
+    <color name="card_background">#FFFFFF</color>
+    <color name="primary_text">#111111</color>
+    <color name="secondary_text">#5F5F5F</color>
+    <color name="primary_orange">#F95830</color>
+    <color name="end_call_red">#B42318</color>
+    <color name="ic_launcher_background">#080916</color>
+</resources>
