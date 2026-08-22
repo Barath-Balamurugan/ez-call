@@ -1,5 +1,30 @@
 # Change Log
 
+## 1.93 - 2026-08-22
+
+- Fixed Continue with Google for Play-distributed builds by using Credential
+  Manager's explicit Google button flow.
+- The account picker can now include accounts that require reauthentication or
+  have not previously authorized EZ Call.
+
+## 1.91 - 2026-08-19
+
+- Removed the visible Back control from the Email sign-in and registration
+  header.
+- Android system back navigation still returns to the authentication provider
+  selection screen.
+
+## 1.90 - 2026-08-19
+
+- Added a dedicated unauthenticated entry screen with the EZ Call name, current
+  app logo, and three provider choices on a fixed dark navy background.
+- Continue with Google starts the existing Google/Firebase authentication flow;
+  Continue with email opens the existing sign-in and registration forms.
+- Continue with Apple is visible but disabled until Apple authentication is
+  implemented.
+- Preserved SMS phone verification, first-time profile completion, password
+  recovery, and existing Firebase profile storage.
+
 ## 1.89 - 2026-08-19
 
 - Replaced the legacy violet UI accent with the EZ Call icon's green palette:

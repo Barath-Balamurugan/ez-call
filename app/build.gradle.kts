@@ -20,8 +20,8 @@ android {
         applicationId = "com.ezcall.onetoone"
         minSdk = 26
         targetSdk = 36
-        versionCode = 90
-        versionName = "1.89"
+        versionCode = 94
+        versionName = "1.94"
 
         if (!hasGoogleServices) {
             resValue("string", "default_web_client_id", "")

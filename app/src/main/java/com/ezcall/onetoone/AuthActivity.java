@@ -1,6 +1,5 @@
 package com.ezcall.onetoone;
 
-import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.res.ColorStateList;
@@ -22,11 +21,14 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import androidx.activity.ComponentActivity;
+import androidx.activity.OnBackPressedCallback;
 import androidx.credentials.Credential;
 import androidx.credentials.CredentialManager;
 import androidx.credentials.CredentialManagerCallback;
@@ -35,7 +37,7 @@ import androidx.credentials.GetCredentialRequest;
 import androidx.credentials.GetCredentialResponse;
 import androidx.credentials.exceptions.GetCredentialException;
 
-import com.google.android.libraries.identity.googleid.GetGoogleIdOption;
+import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption;
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential;
 import com.google.firebase.auth.AuthCredential;
 import com.google.firebase.auth.FirebaseAuth;
@@ -56,7 +58,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.concurrent.TimeUnit;
 
-public class AuthActivity extends Activity {
+public class AuthActivity extends ComponentActivity {
     static final String EXTRA_OPEN_SIGN_IN = "open_sign_in";
     static final String EXTRA_STATUS_MESSAGE = "auth_status_message";
     static final String EXTRA_EMAIL = "auth_email";
@@ -75,11 +77,13 @@ public class AuthActivity extends Activity {
     private TextView titleText;
     private TextView subtitleText;
     private TextView toggleText;
-    private LinearLayout googleDivider;
     private TextView forgotPasswordText;
     private TextView statusText;
+    private TextView providerStatusText;
     private Button actionButton;
-    private Button googleButton;
+    private Button providerGoogleButton;
+    private Button providerAppleButton;
+    private Button providerEmailButton;
     private EditText nameInput;
     private CountryPhoneInput phoneInput;
     private EditText emailInput;
@@ -87,6 +91,8 @@ public class AuthActivity extends Activity {
     private EditText confirmPasswordInput;
     private ImageView photoPreview;
     private ScrollView authScrollView;
+    private View providerChoicesView;
+    private boolean showingProviderChoices = true;
     private String selectedPhotoBase64 = "";
     private CredentialManager credentialManager;
     private AlertDialog smsCodeDialog;
@@ -100,7 +106,20 @@ public class AuthActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        AppTheme.applyWindow(this);
+        getWindow().setStatusBarColor(Color.parseColor("#070812"));
+        getWindow().setNavigationBarColor(Color.parseColor("#05060C"));
+        getWindow().getDecorView().setSystemUiVisibility(0);
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                if (!showingProviderChoices && !completingGoogleProfile) {
+                    showProviderChoices("");
+                    return;
+                }
+                setEnabled(false);
+                getOnBackPressedDispatcher().onBackPressed();
+            }
+        });
         credentialManager = CredentialManager.create(this);
         buildUi();
         applyLaunchState();
@@ -115,7 +134,7 @@ public class AuthActivity extends Activity {
         if (intent.getBooleanExtra(EXTRA_OPEN_SIGN_IN, false)) {
             createAccountMode = false;
             completingGoogleProfile = false;
-            applyMode();
+            showEmailFlow();
         }
         String email = intent.getStringExtra(EXTRA_EMAIL);
         if (email != null && !email.trim().isEmpty()) {
@@ -123,7 +142,7 @@ public class AuthActivity extends Activity {
         }
         String message = intent.getStringExtra(EXTRA_STATUS_MESSAGE);
         if (message != null && !message.trim().isEmpty()) {
-            statusText.setText(message.trim());
+            setVisibleStatus(message.trim());
         }
     }
 
@@ -139,9 +158,19 @@ public class AuthActivity extends Activity {
     }
 
     private void buildUi() {
+        FrameLayout page = new FrameLayout(this);
+        page.setBackground(screenBackground());
+
+        providerChoicesView = providerChoices();
+        page.addView(providerChoicesView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+
         authScrollView = new ScrollView(this);
         authScrollView.setFillViewport(true);
-        authScrollView.setBackground(screenBackground());
+        authScrollView.setBackgroundColor(Color.TRANSPARENT);
+        authScrollView.setVisibility(View.GONE);
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -245,21 +274,6 @@ public class AuthActivity extends Activity {
         actionParams.setMargins(0, dp(14), 0, 0);
         form.addView(actionButton, actionParams);
 
-        googleDivider = divider();
-        LinearLayout.LayoutParams dividerParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-        );
-        dividerParams.setMargins(0, dp(22), 0, dp(16));
-        form.addView(googleDivider, dividerParams);
-
-        googleButton = googleButton();
-        googleButton.setOnClickListener(view -> signInWithGoogle());
-        form.addView(googleButton, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(50)
-        ));
-
         toggleText = text("", 15, "#9D83FF", Typeface.BOLD);
         toggleText.setGravity(Gravity.CENTER);
         toggleText.setPadding(dp(10), dp(24), dp(10), dp(12));
@@ -277,7 +291,11 @@ public class AuthActivity extends Activity {
         ));
 
         applyMode();
-        setContentView(authScrollView);
+        page.addView(authScrollView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+        setContentView(page);
     }
 
     private void applyMode() {
@@ -290,8 +308,6 @@ public class AuthActivity extends Activity {
         confirmPasswordGroup.setVisibility(createAccountMode && !completingGoogleProfile ? View.VISIBLE : View.GONE);
         forgotPasswordText.setVisibility(!createAccountMode && !completingGoogleProfile ? View.VISIBLE : View.GONE);
         toggleText.setVisibility(View.VISIBLE);
-        googleDivider.setVisibility(completingGoogleProfile ? View.GONE : View.VISIBLE);
-        googleButton.setVisibility(completingGoogleProfile ? View.GONE : View.VISIBLE);
 
         if (completingGoogleProfile) {
             titleText.setText("Complete your profile");
@@ -310,6 +326,121 @@ public class AuthActivity extends Activity {
         }
         statusText.setText("");
         authScrollView.post(() -> authScrollView.fullScroll(View.FOCUS_UP));
+    }
+
+    private View providerChoices() {
+        ScrollView scrollView = new ScrollView(this);
+        scrollView.setFillViewport(true);
+        scrollView.setBackgroundColor(Color.TRANSPARENT);
+
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setGravity(Gravity.CENTER_HORIZONTAL);
+        content.setPadding(dp(28), dp(54), dp(28), dp(34));
+        scrollView.addView(content, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+
+        View topSpace = new View(this);
+        content.addView(topSpace, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                0.65f
+        ));
+
+        ImageView logo = new ImageView(this);
+        logo.setImageResource(R.drawable.ic_launcher_foreground);
+        logo.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        logo.setContentDescription("EZ Call logo");
+        content.addView(logo, new LinearLayout.LayoutParams(dp(210), dp(210)));
+
+        TextView appName = text("EZ Call", 43, "#FFFFFF", Typeface.BOLD);
+        appName.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams nameParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        nameParams.setMargins(0, dp(2), 0, dp(38));
+        content.addView(appName, nameParams);
+
+        providerGoogleButton = providerButton("Continue with Google", true);
+        providerGoogleButton.setOnClickListener(view -> signInWithGoogle());
+        content.addView(providerGoogleButton, providerButtonParams(0));
+
+        providerAppleButton = providerButton("Continue with Apple", false);
+        providerAppleButton.setEnabled(false);
+        providerAppleButton.setAlpha(0.42f);
+        providerAppleButton.setContentDescription("Continue with Apple, coming soon");
+        content.addView(providerAppleButton, providerButtonParams(12));
+
+        providerEmailButton = providerButton("Continue with email", true);
+        providerEmailButton.setBackground(primaryBackground());
+        providerEmailButton.setTextColor(Color.BLACK);
+        providerEmailButton.setOnClickListener(view -> {
+            createAccountMode = false;
+            completingGoogleProfile = false;
+            showEmailFlow();
+        });
+        content.addView(providerEmailButton, providerButtonParams(12));
+
+        providerStatusText = text("", 14, "#D8D5E0", Typeface.BOLD);
+        providerStatusText.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        statusParams.setMargins(0, dp(18), 0, 0);
+        content.addView(providerStatusText, statusParams);
+
+        View bottomSpace = new View(this);
+        content.addView(bottomSpace, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                0.35f
+        ));
+        return scrollView;
+    }
+
+    private LinearLayout.LayoutParams providerButtonParams(int topMargin) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(54)
+        );
+        params.setMargins(0, dp(topMargin), 0, 0);
+        return params;
+    }
+
+    private Button providerButton(String label, boolean enabled) {
+        Button button = secondaryButton(label);
+        button.setEnabled(enabled);
+        button.setTextSize(16);
+        return button;
+    }
+
+    private void showEmailFlow() {
+        showingProviderChoices = false;
+        providerChoicesView.setVisibility(View.GONE);
+        authScrollView.setVisibility(View.VISIBLE);
+        applyMode();
+    }
+
+    private void showProviderChoices(String status) {
+        if (completingGoogleProfile) {
+            return;
+        }
+        showingProviderChoices = true;
+        authScrollView.setVisibility(View.GONE);
+        providerChoicesView.setVisibility(View.VISIBLE);
+        providerStatusText.setText(status);
+    }
+
+    private void setVisibleStatus(String status) {
+        if (showingProviderChoices) {
+            providerStatusText.setText(status);
+        } else {
+            statusText.setText(status);
+        }
     }
     private void restoreExistingSessionIfPossible() {
         if (!FirebaseCallRepository.isConfigured(this) || FirebaseAuth.getInstance().getCurrentUser() == null) {
@@ -559,14 +690,14 @@ public class AuthActivity extends Activity {
 
     private void signInWithGoogle() {
         if (!FirebaseCallRepository.isConfigured(this)) {
-            statusText.setText("Firebase is not configured.");
+            setBusy(false, "Firebase is not configured.");
             return;
         }
 
         setBusy(true, "Opening Google sign-in...");
-        GetGoogleIdOption googleIdOption = new GetGoogleIdOption.Builder()
-                .setFilterByAuthorizedAccounts(false)
-                .setServerClientId(getString(R.string.default_web_client_id))
+        GetSignInWithGoogleOption googleIdOption = new GetSignInWithGoogleOption.Builder(
+                getString(R.string.default_web_client_id)
+        )
                 .build();
         GetCredentialRequest request = new GetCredentialRequest.Builder()
                 .addCredentialOption(googleIdOption)
@@ -633,6 +764,9 @@ public class AuthActivity extends Activity {
     private void showProfileCompletion() {
         completingGoogleProfile = true;
         createAccountMode = false;
+        showingProviderChoices = false;
+        providerChoicesView.setVisibility(View.GONE);
+        authScrollView.setVisibility(View.VISIBLE);
         FirebaseUser user = FirebaseAuth.getInstance().getCurrentUser();
         if (user != null) {
             if (user.getDisplayName() != null && !user.getDisplayName().trim().isEmpty()) {
@@ -804,7 +938,7 @@ public class AuthActivity extends Activity {
         smsCodeInput = input("6-digit code", InputType.TYPE_CLASS_NUMBER);
         smsCodeInput.setFilters(new InputFilter[]{new InputFilter.LengthFilter(6)});
         smsCodeInput.setGravity(Gravity.CENTER);
-        smsCodeInput.setTextColor(AppTheme.primaryText(this));
+        smsCodeInput.setTextColor(color("#FFFFFF"));
         smsCodeInput.setHintTextColor(color("#777582"));
         smsCodeInput.setBackground(rounded("#0F101C", dp(12), "#454451", 1));
 
@@ -955,7 +1089,7 @@ public class AuthActivity extends Activity {
             phoneInput.clear();
             selectedPhotoBase64 = "";
             photoPreview.setImageResource(R.drawable.ic_default_user);
-            applyMode();
+            showProviderChoices("Choose an account to continue.");
             setBusy(false, "Choose an account to continue.");
         });
     }
@@ -968,13 +1102,15 @@ public class AuthActivity extends Activity {
     private void setBusy(boolean busy, String status) {
         actionButton.setEnabled(!busy);
         toggleText.setEnabled(!busy);
-        googleButton.setEnabled(!busy);
+        providerGoogleButton.setEnabled(!busy);
+        providerEmailButton.setEnabled(!busy);
         forgotPasswordText.setEnabled(!busy);
         actionButton.setAlpha(busy ? 0.65f : 1f);
         toggleText.setAlpha(busy ? 0.65f : 1f);
-        googleButton.setAlpha(busy ? 0.65f : 1f);
+        providerGoogleButton.setAlpha(busy ? 0.65f : 1f);
+        providerEmailButton.setAlpha(busy ? 0.65f : 1f);
         forgotPasswordText.setAlpha(busy ? 0.65f : 1f);
-        statusText.setText(status);
+        setVisibleStatus(status);
     }
 
     private String readableGoogleError(GetCredentialException error) {
@@ -1131,7 +1267,7 @@ public class AuthActivity extends Activity {
         EditText editText = new EditText(this);
         editText.setHint(hint);
         editText.setTextSize(16);
-        editText.setTextColor(AppTheme.primaryText(this));
+        editText.setTextColor(color("#FFFFFF"));
         editText.setHintTextColor(color("#777582"));
         editText.setSingleLine(true);
         editText.setInputType(inputType);
@@ -1204,46 +1340,10 @@ public class AuthActivity extends Activity {
         button.setText(label);
         button.setAllCaps(false);
         button.setTextSize(16);
-        button.setTextColor(AppTheme.primaryText(this));
+        button.setTextColor(color("#FFFFFF"));
         button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         button.setBackground(rounded("#10FFFFFF", dp(12), "#1AFFFFFF", 1));
         return button;
-    }
-
-    private Button googleButton() {
-        Button button = new Button(this);
-        button.setText("Continue with Google");
-        button.setAllCaps(false);
-        button.setTextSize(16);
-        button.setTextColor(AppTheme.primaryText(this));
-        button.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        button.setBackground(rounded("#10FFFFFF", dp(12), "#1AFFFFFF", 1));
-        return button;
-    }
-
-    private LinearLayout divider() {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-
-        View leftLine = new View(this);
-        leftLine.setBackgroundColor(color("#1AFFFFFF"));
-        row.addView(leftLine, new LinearLayout.LayoutParams(0, dp(1), 1));
-
-        TextView label = text("OR CONTINUE WITH", 11, "#777582", Typeface.BOLD);
-        label.setLetterSpacing(0.06f);
-        label.setGravity(Gravity.CENTER);
-        LinearLayout.LayoutParams labelParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-        );
-        labelParams.setMargins(dp(14), 0, dp(14), 0);
-        row.addView(label, labelParams);
-
-        View rightLine = new View(this);
-        rightLine.setBackgroundColor(color("#1AFFFFFF"));
-        row.addView(rightLine, new LinearLayout.LayoutParams(0, dp(1), 1));
-        return row;
     }
 
     private TextView text(String value, int sp, String color, int style) {
@@ -1283,7 +1383,10 @@ public class AuthActivity extends Activity {
     }
 
     private int color(String hex) {
-        return AppTheme.color(this, hex);
+        return Color.parseColor(AppThemePalette.accentToken(
+                AppSettings.accentPreference(this),
+                hex
+        ));
     }
 
     private int dp(int value) {

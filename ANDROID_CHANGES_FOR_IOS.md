@@ -3,6 +3,49 @@
 This file records Android behavior that should be considered when maintaining
 the separate iPhone application.
 
+## 2026-08-22 - Explicit Google sign-in button flow
+
+- Continue with Google now uses Credential Manager's explicit button flow
+  instead of its automatic bottom-sheet credential flow.
+- This prevents false "No credentials found" failures for Play-installed users
+  whose Google accounts require reauthentication or have not authorized the app.
+- Android app version is 1.93 (94).
+
+### Suggested iOS equivalent
+
+- Keep Google authentication attached to an explicit provider button and allow
+  users to choose or reauthenticate an account before Firebase authentication.
+
+## 2026-08-19 - Simplify authentication form header
+
+- Removed the visible Back control from Email sign-in and registration.
+- The platform back gesture still returns to the provider-selection screen.
+- Android app version is 1.91 (92).
+
+### Suggested iOS equivalent
+
+- Keep the form header visually minimal while retaining the native interactive
+  back gesture to return to provider selection.
+
+## 2026-08-19 - Authentication provider entry screen
+
+- The first unauthenticated screen uses a fixed dark navy background and shows
+  only the EZ Call logo, app name, Continue with Google, Continue with Apple,
+  and Continue with email.
+- Google starts authentication immediately and then opens profile completion
+  only for users who do not yet have a calling profile.
+- Email opens the existing sign-in form, which links to account registration;
+  signup still requires SMS phone verification before profile creation.
+- Apple remains visible but disabled until its authentication implementation is
+  available.
+- Android app version is 1.90 (91).
+
+### Suggested iOS equivalent
+
+- Use the same provider-first entry hierarchy and fixed dark authentication
+  surface. Enable Continue with Apple when Sign in with Apple is connected to
+  the same Firebase project and profile-completion contract.
+
 ## 2026-08-19 - Use the icon greens as the app accent
 
 - Replaced the legacy violet accent with the EZ Call icon palette: vivid
