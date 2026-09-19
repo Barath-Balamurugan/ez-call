@@ -112,6 +112,13 @@ final class CountryPhoneInput extends LinearLayout {
         numberInput.setText("");
     }
 
+    void useDarkSurfaceAppearance() {
+        setBackground(rawRounded("#10FFFFFF", dp(12), "#1AFFFFFF", 1));
+        countryButton.setTextColor(Color.WHITE);
+        numberInput.setTextColor(Color.WHITE);
+        numberInput.setHintTextColor(Color.parseColor("#777582"));
+    }
+
     private void loadCountryMetadata(Context context) {
         PhoneNumberUtil util = PhoneNumberUtil.createInstance(context);
         List<CountryOption> options = new ArrayList<>();
@@ -156,7 +163,10 @@ final class CountryPhoneInput extends LinearLayout {
                 selectedRegionCode = detectedRegion;
                 updateCountryButton();
             }
-            numberInput.setText(util.format(parsed, PhoneNumberUtil.PhoneNumberFormat.NATIONAL));
+            // The country calling code is already displayed in the separate selector.
+            // NATIONAL formatting adds domestic trunk prefixes (such as India's 0).
+            // Keep significant leading zeros, including those in Italian numbers.
+            numberInput.setText(util.getNationalSignificantNumber(parsed));
             numberInput.setSelection(numberInput.length());
             pendingPhoneNumber = "";
         } catch (NumberParseException ignored) {
@@ -296,6 +306,16 @@ final class CountryPhoneInput extends LinearLayout {
         drawable.setCornerRadius(radius);
         if (strokeDp > 0) {
             drawable.setStroke(dp(strokeDp), themeColor(stroke));
+        }
+        return drawable;
+    }
+
+    private GradientDrawable rawRounded(String fill, int radius, String stroke, int strokeDp) {
+        GradientDrawable drawable = new GradientDrawable();
+        drawable.setColor(Color.parseColor(fill));
+        drawable.setCornerRadius(radius);
+        if (strokeDp > 0) {
+            drawable.setStroke(dp(strokeDp), Color.parseColor(stroke));
         }
         return drawable;
     }

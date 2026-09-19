@@ -60,6 +60,8 @@ final class WebRtcCallClient {
         void onReconnecting();
 
         void onReconnectFailed();
+
+        void onInitialConnectionFailed();
     }
 
     private static final String TAG = "WebRtcCallClient";
@@ -72,6 +74,7 @@ final class WebRtcCallClient {
     private static final long DISCONNECT_RESTART_DELAY_MILLIS = 1200L;
     private static final long RESTART_RETRY_MILLIS = 7000L;
     private static final long RECONNECT_TIMEOUT_MILLIS = 25_000L;
+    private static final long INITIAL_CONNECTION_TIMEOUT_MILLIS = 35_000L;
 
     private final Context context;
     private final Object cameraLifecycleLock = new Object();
@@ -83,6 +86,7 @@ final class WebRtcCallClient {
     private final RemoteCameraStateListener remoteCameraStateListener;
     private final RemoteAudioLevelListener remoteAudioLevelListener;
     private final ConnectionStateListener connectionStateListener;
+    private final List<FirebaseCallRepository.IceServerConfiguration> turnIceServers;
     private final DocumentReference callRef;
     private final CallAudioRouter callAudioRouter;
     private final Handler connectionHandler = new Handler(Looper.getMainLooper());
@@ -95,7 +99,9 @@ final class WebRtcCallClient {
 
     private EglBase eglBase;
     private PeerConnectionFactory factory;
-    private PeerConnection peerConnection;
+    // Read from WebRTC's signaling thread by the SDP and ICE callbacks, written from the
+    // main thread by start()/stop().
+    private volatile PeerConnection peerConnection;
     private VideoCapturer videoCapturer;
     private SurfaceTextureHelper cameraTextureHelper;
     private VideoSource videoSource;
@@ -137,6 +143,7 @@ final class WebRtcCallClient {
     private final Runnable delayedRestartRequest = () -> requestIceRestart("ICE disconnected");
     private final Runnable restartRetry = this::retryIceRestart;
     private final Runnable reconnectTimeout = this::handleReconnectTimeout;
+    private final Runnable initialConnectionTimeout = this::handleInitialConnectionTimeout;
     private final CameraVideoCapturer.CameraEventsHandler cameraEventsHandler =
             new CameraVideoCapturer.CameraEventsHandler() {
                 @Override
@@ -181,7 +188,8 @@ final class WebRtcCallClient {
             SurfaceViewRenderer remoteRenderer,
             RemoteCameraStateListener remoteCameraStateListener,
             RemoteAudioLevelListener remoteAudioLevelListener,
-            ConnectionStateListener connectionStateListener
+            ConnectionStateListener connectionStateListener,
+            List<FirebaseCallRepository.IceServerConfiguration> turnIceServers
     ) {
         this.context = context.getApplicationContext();
         this.callId = callId;
@@ -191,6 +199,9 @@ final class WebRtcCallClient {
         this.remoteCameraStateListener = remoteCameraStateListener;
         this.remoteAudioLevelListener = remoteAudioLevelListener;
         this.connectionStateListener = connectionStateListener;
+        this.turnIceServers = turnIceServers == null
+                ? new ArrayList<>()
+                : new ArrayList<>(turnIceServers);
         this.callRef = FirebaseFirestore.getInstance().collection("calls").document(callId);
         this.callAudioRouter = new CallAudioRouter(this.context);
     }
@@ -206,6 +217,7 @@ final class WebRtcCallClient {
             initializeRenderers();
             createPeerConnection();
             createLocalMedia();
+            connectionHandler.postDelayed(initialConnectionTimeout, INITIAL_CONNECTION_TIMEOUT_MILLIS);
             listenForRemoteCandidates();
             listenForRemoteCameraState();
             monitorNetworkChanges();
@@ -254,10 +266,14 @@ final class WebRtcCallClient {
                 videoCapturer = null;
             }
         }
-        if (peerConnection != null) {
-            peerConnection.close();
-            peerConnection.dispose();
-            peerConnection = null;
+        // Clear the field before closing. close() blocks on the signaling thread, so
+        // in-flight SDP callbacks run during it; they must see null and bail rather than
+        // reach a connection that is about to be disposed.
+        PeerConnection closingConnection = peerConnection;
+        peerConnection = null;
+        if (closingConnection != null) {
+            closingConnection.close();
+            closingConnection.dispose();
         }
         if (localVideoTrack != null) {
             localVideoTrack.dispose();
@@ -295,9 +311,21 @@ final class WebRtcCallClient {
         }
     }
 
-    private void requestRemoteAudioLevel() {
+    /**
+     * The live peer connection, or null once the call is tearing down.
+     *
+     * <p>SDP and ICE callbacks arrive on WebRTC's signaling thread while {@link #stop()}
+     * runs on the main thread, so they must re-read through this instead of touching the
+     * field directly: by the time a callback fires, the connection may already be gone.
+     */
+    private PeerConnection activePeerConnection() {
         PeerConnection connection = peerConnection;
-        if (stopped || connection == null) {
+        return stopped ? null : connection;
+    }
+
+    private void requestRemoteAudioLevel() {
+        PeerConnection connection = activePeerConnection();
+        if (connection == null) {
             return;
         }
         connection.getStats(report -> {
@@ -406,6 +434,12 @@ final class WebRtcCallClient {
         List<PeerConnection.IceServer> iceServers = new ArrayList<>();
         iceServers.add(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer());
         iceServers.add(PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer());
+        for (FirebaseCallRepository.IceServerConfiguration turnServer : turnIceServers) {
+            iceServers.add(PeerConnection.IceServer.builder(turnServer.urls)
+                    .setUsername(turnServer.username)
+                    .setPassword(turnServer.credential)
+                    .createIceServer());
+        }
 
         PeerConnection.RTCConfiguration configuration = new PeerConnection.RTCConfiguration(iceServers);
         configuration.sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN;
@@ -486,6 +520,11 @@ final class WebRtcCallClient {
                 }
             }
         });
+        if (peerConnection == null) {
+            // start() turns this into the on-screen setup error instead of letting
+            // createLocalMedia() dereference null.
+            throw new IllegalStateException("WebRTC could not create a peer connection.");
+        }
     }
 
     private void createLocalMedia() {
@@ -610,17 +649,29 @@ final class WebRtcCallClient {
     }
 
     private void createOffer(int generation, boolean iceRestart) {
+        PeerConnection connection = activePeerConnection();
+        if (connection == null) {
+            return;
+        }
         localIceGeneration = generation;
         if (!iceRestart) {
             callRef.set(baseCallData(), com.google.firebase.firestore.SetOptions.merge());
         }
-        peerConnection.createOffer(new SimpleSdpObserver("create offer") {
+        connection.createOffer(new SimpleSdpObserver("create offer") {
             @Override
             public void onCreateSuccess(SessionDescription description) {
                 Log.d(TAG, "Created local offer with SDP length " + sdpLength(description));
-                peerConnection.setLocalDescription(new SimpleSdpObserver("set local offer") {
+                PeerConnection active = activePeerConnection();
+                if (active == null) {
+                    Log.d(TAG, "Dropping offer generation " + generation + "; the call ended.");
+                    return;
+                }
+                active.setLocalDescription(new SimpleSdpObserver("set local offer") {
                     @Override
                     public void onSetSuccess() {
+                        if (stopped) {
+                            return;
+                        }
                         Map<String, Object> offerData = new HashMap<>();
                         offerData.put("offer", sdpMap(description));
                         offerData.put("offerGeneration", generation);
@@ -677,12 +728,16 @@ final class WebRtcCallClient {
                 return;
             }
 
+            PeerConnection connection = activePeerConnection();
+            if (connection == null) {
+                return;
+            }
             handlingOfferGeneration = generation;
             localIceGeneration = generation;
             remoteDescriptionSet = false;
             Log.d(TAG, "Applying remote offer generation " + generation
                     + " with SDP length " + sdpLength(remoteOffer));
-            peerConnection.setRemoteDescription(new SimpleSdpObserver("set remote offer") {
+            connection.setRemoteDescription(new SimpleSdpObserver("set remote offer") {
                 @Override
                 public void onSetSuccess() {
                     handlingOfferGeneration = 0;
@@ -706,13 +761,25 @@ final class WebRtcCallClient {
     }
 
     private void createAnswer(int generation) {
-        peerConnection.createAnswer(new SimpleSdpObserver("create answer") {
+        PeerConnection connection = activePeerConnection();
+        if (connection == null) {
+            return;
+        }
+        connection.createAnswer(new SimpleSdpObserver("create answer") {
             @Override
             public void onCreateSuccess(SessionDescription description) {
                 Log.d(TAG, "Created local answer with SDP length " + sdpLength(description));
-                peerConnection.setLocalDescription(new SimpleSdpObserver("set local answer") {
+                PeerConnection active = activePeerConnection();
+                if (active == null) {
+                    Log.d(TAG, "Dropping answer generation " + generation + "; the call ended.");
+                    return;
+                }
+                active.setLocalDescription(new SimpleSdpObserver("set local answer") {
                     @Override
                     public void onSetSuccess() {
+                        if (stopped) {
+                            return;
+                        }
                         Map<String, Object> answerData = new HashMap<>();
                         answerData.put("answer", sdpMap(description));
                         answerData.put("answerGeneration", generation);
@@ -755,11 +822,15 @@ final class WebRtcCallClient {
                 return;
             }
 
+            PeerConnection connection = activePeerConnection();
+            if (connection == null) {
+                return;
+            }
             handlingAnswerGeneration = generation;
             remoteDescriptionSet = false;
             Log.d(TAG, "Applying remote answer generation " + generation
                     + " with SDP length " + sdpLength(remoteAnswer));
-            peerConnection.setRemoteDescription(new SimpleSdpObserver("set remote answer") {
+            connection.setRemoteDescription(new SimpleSdpObserver("set remote answer") {
                 @Override
                 public void onSetSuccess() {
                     handlingAnswerGeneration = 0;
@@ -806,6 +877,10 @@ final class WebRtcCallClient {
             if (snapshot == null || snapshot.isEmpty()) {
                 return;
             }
+            PeerConnection connection = activePeerConnection();
+            if (connection == null) {
+                return;
+            }
 
             for (int i = 0; i < snapshot.getDocuments().size(); i++) {
                 String documentId = snapshot.getDocuments().get(i).getId();
@@ -829,7 +904,7 @@ final class WebRtcCallClient {
                         generation,
                         remoteDescriptionGeneration
                 )) {
-                    boolean added = peerConnection.addIceCandidate(remoteCandidate);
+                    boolean added = connection.addIceCandidate(remoteCandidate);
                     Log.d(TAG, "Remote ICE candidate " + documentId + " generation "
                             + generation + " added=" + added + ": " + candidateSummary(remoteCandidate));
                 } else if (generation >= Math.max(
@@ -847,7 +922,12 @@ final class WebRtcCallClient {
         }));
     }
 
+    /** Runs on the signaling thread from the setRemoteDescription callbacks. */
     private void flushPendingRemoteCandidates() {
+        PeerConnection connection = activePeerConnection();
+        if (connection == null) {
+            return;
+        }
         List<GenerationCandidate> futureCandidates = new ArrayList<>();
         for (GenerationCandidate pending : pendingRemoteCandidates) {
             if (pending.generation > remoteDescriptionGeneration) {
@@ -860,7 +940,7 @@ final class WebRtcCallClient {
             )) {
                 continue;
             }
-            boolean added = peerConnection.addIceCandidate(pending.candidate);
+            boolean added = connection.addIceCandidate(pending.candidate);
             Log.d(TAG, "Flushed queued remote ICE candidate generation "
                     + pending.generation + " added=" + added + ": "
                     + candidateSummary(pending.candidate));
@@ -927,6 +1007,7 @@ final class WebRtcCallClient {
             return;
         }
         everConnected = true;
+        connectionHandler.removeCallbacks(initialConnectionTimeout);
         reconnecting = false;
         restartOfferInProgress = false;
         connectionHandler.removeCallbacks(delayedRestartRequest);
@@ -983,7 +1064,7 @@ final class WebRtcCallClient {
         if (stopped || !caller || !everConnected || !reconnecting) {
             return;
         }
-        PeerConnection connection = peerConnection;
+        PeerConnection connection = activePeerConnection();
         if (connection == null) {
             return;
         }
@@ -1024,6 +1105,13 @@ final class WebRtcCallClient {
         }
     }
 
+    private void handleInitialConnectionTimeout() {
+        if (!stopped && !everConnected && connectionStateListener != null) {
+            Log.w(TAG, "Initial media connection timed out; check signaling and ICE connectivity.");
+            connectionStateListener.onInitialConnectionFailed();
+        }
+    }
+
     private void handleReconnectTimeout() {
         if (!stopped && reconnecting && connectionStateListener != null) {
             connectionStateListener.onReconnectFailed();
@@ -1032,9 +1120,8 @@ final class WebRtcCallClient {
 
     private void maybeConfirmConnected() {
         connectionHandler.postDelayed(() -> {
-            PeerConnection connection = peerConnection;
-            if (!stopped
-                    && reconnecting
+            PeerConnection connection = activePeerConnection();
+            if (reconnecting
                     && connection != null
                     && connection.connectionState() == PeerConnection.PeerConnectionState.CONNECTED) {
                 handleConnected();

@@ -21,8 +21,14 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import com.google.android.gms.tasks.Task;
+import com.google.firebase.FirebaseTooManyRequestsException;
 import com.google.firebase.auth.FirebaseAuth;
+import com.google.firebase.auth.FirebaseAuthRecentLoginRequiredException;
+import com.google.firebase.auth.FirebaseAuthUserCollisionException;
 import com.google.firebase.auth.FirebaseUser;
+import com.google.firebase.auth.PhoneAuthCredential;
+import com.google.firebase.auth.PhoneAuthProvider;
 import com.google.firebase.auth.UserProfileChangeRequest;
 
 import java.io.ByteArrayOutputStream;
@@ -41,6 +47,7 @@ public class ProfileActivity extends Activity {
     private ImageView photoPreview;
     private Button saveButton;
     private String selectedPhotoBase64 = "";
+    private PhoneVerificationPrompt phoneVerificationPrompt;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -48,6 +55,15 @@ public class ProfileActivity extends Activity {
         AppTheme.applyWindow(this);
         buildUi();
         loadProfile();
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (phoneVerificationPrompt != null) {
+            phoneVerificationPrompt.dismiss();
+            phoneVerificationPrompt = null;
+        }
+        super.onDestroy();
     }
 
     private void buildUi() {
@@ -264,13 +280,97 @@ public class ProfileActivity extends Activity {
             return;
         }
 
-        setBusy(true, "Saving profile...");
         FirebaseUser user = FirebaseAuth.getInstance().getCurrentUser();
-        if (user != null) {
-            user.updateProfile(new UserProfileChangeRequest.Builder()
-                    .setDisplayName(displayName)
-                    .build());
+        if (user == null) {
+            setBusy(false, "You are not logged in.");
+            return;
         }
+
+        // The users/{phone} document is keyed by phone number and Firestore only accepts it
+        // from an account whose verified phone number matches. Moving to a new number must
+        // therefore update Firebase Auth first, or the write is rejected.
+        if (PhoneVerificationPrompt.sameNumber(phoneNumber, user.getPhoneNumber())) {
+            writeProfile(user, displayName, phoneNumber);
+            return;
+        }
+        verifyNewPhoneNumberThenSave(user, displayName, phoneNumber);
+    }
+
+    private void verifyNewPhoneNumberThenSave(
+            FirebaseUser user,
+            String displayName,
+            String phoneNumber
+    ) {
+        if (phoneVerificationPrompt != null) {
+            phoneVerificationPrompt.dismiss();
+        }
+        phoneVerificationPrompt = new PhoneVerificationPrompt(
+                this,
+                new PhoneVerificationPrompt.Callbacks() {
+                    @Override
+                    public void onPhoneCredentialReady(
+                            PhoneAuthCredential credential,
+                            PhoneVerificationPrompt.Result result
+                    ) {
+                        applyVerifiedPhoneNumber(
+                                user,
+                                displayName,
+                                phoneNumber,
+                                credential,
+                                result
+                        );
+                    }
+
+                    @Override
+                    public void onPhoneVerificationStatus(String message) {
+                        setBusy(true, message);
+                    }
+
+                    @Override
+                    public void onPhoneVerificationCancelled() {
+                        setBusy(false, "Phone number not changed.");
+                    }
+
+                    @Override
+                    public void onPhoneVerificationFailed(Exception error) {
+                        setBusy(false, readablePhoneVerificationError(error));
+                    }
+                }
+        );
+        phoneVerificationPrompt.start(phoneNumber);
+    }
+
+    private void applyVerifiedPhoneNumber(
+            FirebaseUser user,
+            String displayName,
+            String phoneNumber,
+            PhoneAuthCredential credential,
+            PhoneVerificationPrompt.Result result
+    ) {
+        if (credential == null) {
+            result.accept();
+            writeProfile(user, displayName, phoneNumber);
+            return;
+        }
+        // updatePhoneNumber replaces an existing phone provider; accounts that never had
+        // one (an older Google sign-in) need the provider linked instead.
+        boolean hasPhoneProvider = user.getProviderData().stream()
+                .anyMatch(info -> PhoneAuthProvider.PROVIDER_ID.equals(info.getProviderId()));
+        Task<?> update = hasPhoneProvider
+                ? user.updatePhoneNumber(credential)
+                : user.linkWithCredential(credential);
+        update.addOnSuccessListener(unused -> {
+                    result.accept();
+                    writeProfile(user, displayName, phoneNumber);
+                })
+                .addOnFailureListener(result::reject);
+    }
+
+    private void writeProfile(FirebaseUser user, String displayName, String phoneNumber) {
+        setBusy(true, "Saving profile...");
+        user.updateProfile(new UserProfileChangeRequest.Builder()
+                .setDisplayName(displayName)
+                .build());
 
         FirebaseCallRepository.updateCurrentUserProfile(
                 this,
@@ -289,6 +389,19 @@ public class ProfileActivity extends Activity {
                     }
                 }
         );
+    }
+
+    private String readablePhoneVerificationError(Exception error) {
+        if (error instanceof FirebaseAuthUserCollisionException) {
+            return "That phone number is already registered to another EZ Call account.";
+        }
+        if (error instanceof FirebaseTooManyRequestsException) {
+            return "Too many verification attempts. Try again later.";
+        }
+        if (error instanceof FirebaseAuthRecentLoginRequiredException) {
+            return "Sign out and back in, then change your phone number.";
+        }
+        return readableError(error);
     }
 
     private void signOut() {

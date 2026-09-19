@@ -2,6 +2,7 @@ package com.ezcall.onetoone;
 
 import android.app.AlertDialog;
 import android.content.Intent;
+import android.content.IntentSender;
 import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -11,10 +12,10 @@ import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.CancellationSignal;
-import android.text.InputFilter;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.util.Base64;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -36,9 +37,14 @@ import androidx.credentials.CustomCredential;
 import androidx.credentials.GetCredentialRequest;
 import androidx.credentials.GetCredentialResponse;
 import androidx.credentials.exceptions.GetCredentialException;
+import androidx.credentials.exceptions.NoCredentialException;
 
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption;
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential;
+import com.google.android.gms.auth.api.identity.GetSignInIntentRequest;
+import com.google.android.gms.auth.api.identity.Identity;
+import com.google.android.gms.auth.api.identity.SignInCredential;
+import com.google.android.gms.common.api.ApiException;
 import com.google.firebase.auth.AuthCredential;
 import com.google.firebase.auth.FirebaseAuth;
 import com.google.firebase.auth.FirebaseAuthException;
@@ -47,22 +53,21 @@ import com.google.firebase.auth.FirebaseAuthUserCollisionException;
 import com.google.firebase.auth.FirebaseUser;
 import com.google.firebase.auth.GoogleAuthProvider;
 import com.google.firebase.auth.PhoneAuthCredential;
-import com.google.firebase.auth.PhoneAuthOptions;
-import com.google.firebase.auth.PhoneAuthProvider;
 import com.google.firebase.auth.UserProfileChangeRequest;
-import com.google.firebase.FirebaseException;
 import com.google.firebase.FirebaseTooManyRequestsException;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.concurrent.TimeUnit;
+import java.util.Locale;
 
 public class AuthActivity extends ComponentActivity {
+    private static final String TAG = "EzCallGoogleSignIn";
     static final String EXTRA_OPEN_SIGN_IN = "open_sign_in";
     static final String EXTRA_STATUS_MESSAGE = "auth_status_message";
     static final String EXTRA_EMAIL = "auth_email";
     private static final int PICK_PROFILE_PHOTO_REQUEST = 12;
+    private static final int GOOGLE_IDENTITY_SIGN_IN_REQUEST = 13;
     private static final int PROFILE_PHOTO_MAX_SIZE = 640;
     private static final int PROFILE_PHOTO_JPEG_QUALITY = 72;
 
@@ -95,13 +100,8 @@ public class AuthActivity extends ComponentActivity {
     private boolean showingProviderChoices = true;
     private String selectedPhotoBase64 = "";
     private CredentialManager credentialManager;
-    private AlertDialog smsCodeDialog;
-    private EditText smsCodeInput;
-    private String phoneBeingVerified = "";
-    private String phoneVerificationId = "";
-    private PhoneAuthProvider.ForceResendingToken phoneResendToken;
-    private PhoneVerifiedAction pendingPhoneVerifiedAction;
-    private int phoneVerificationGeneration;
+    private PhoneVerificationPrompt phoneVerificationPrompt;
+    private boolean googleSignInFallbackAttempted;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -148,11 +148,9 @@ public class AuthActivity extends ComponentActivity {
 
     @Override
     protected void onDestroy() {
-        phoneVerificationGeneration++;
-        pendingPhoneVerifiedAction = null;
-        if (smsCodeDialog != null) {
-            smsCodeDialog.dismiss();
-            smsCodeDialog = null;
+        if (phoneVerificationPrompt != null) {
+            phoneVerificationPrompt.dismiss();
+            phoneVerificationPrompt = null;
         }
         super.onDestroy();
     }
@@ -221,6 +219,7 @@ public class AuthActivity extends ComponentActivity {
         form.addView(nameGroup);
 
         phoneInput = new CountryPhoneInput(this);
+        phoneInput.useDarkSurfaceAppearance();
         phoneGroup = fieldGroup("Phone number for calls", phoneInput);
         form.addView(phoneGroup);
 
@@ -502,29 +501,44 @@ public class AuthActivity extends ComponentActivity {
         );
         beginPhoneVerification(
                 phoneNumber,
-                credential -> createEmailAccountAfterPhoneVerification(registration, credential)
+                (credential, result) ->
+                        createEmailAccountAfterPhoneVerification(registration, credential, result)
         );
     }
 
     private void createEmailAccountAfterPhoneVerification(
             PendingEmailRegistration registration,
-            PhoneAuthCredential phoneCredential
+            PhoneAuthCredential phoneCredential,
+            PhoneVerificationPrompt.Result result
     ) {
         setBusy(true, "Creating your verified account...");
         FirebaseAuth.getInstance()
                 .createUserWithEmailAndPassword(registration.email, registration.password)
-                .addOnSuccessListener(result -> {
-                    FirebaseUser user = result.getUser();
+                .addOnSuccessListener(created -> {
+                    FirebaseUser user = created.getUser();
                     if (user == null) {
                         FirebaseAuth.getInstance().signOut();
-                        setBusy(false, "Could not create your account. Try again.");
+                        result.reject(new IllegalStateException(
+                                "Could not create your account. Try again."
+                        ));
+                        return;
+                    }
+                    if (phoneCredential == null) {
+                        result.accept();
+                        saveNewEmailProfile(user, registration);
                         return;
                     }
                     user.linkWithCredential(phoneCredential)
-                            .addOnSuccessListener(linked -> saveNewEmailProfile(user, registration))
-                            .addOnFailureListener(error -> deleteNewAccountAfterPhoneFailure(user, error));
+                            .addOnSuccessListener(linked -> {
+                                result.accept();
+                                saveNewEmailProfile(user, registration);
+                            })
+                            .addOnFailureListener(error ->
+                                    deleteNewAccountAfterPhoneFailure(user, error, result));
                 })
-                .addOnFailureListener(error -> setBusy(false, readableError(error)));
+                // The email or password was rejected, not the SMS code, so retyping the code
+                // cannot help. reject() ends the session and reports through onPhoneVerificationFailed.
+                .addOnFailureListener(result::reject);
     }
 
     private void saveNewEmailProfile(
@@ -559,16 +573,42 @@ public class AuthActivity extends ComponentActivity {
         );
     }
 
-    private void deleteNewAccountAfterPhoneFailure(FirebaseUser user, Exception error) {
+    /**
+     * Drops the account that was created moments ago so the email address stays free, then
+     * hands the failure back to the prompt. A wrong code reopens the code dialog and the
+     * next attempt recreates the account.
+     */
+    private void deleteNewAccountAfterPhoneFailure(
+            FirebaseUser user,
+            Exception error,
+            PhoneVerificationPrompt.Result result
+    ) {
         user.delete().addOnCompleteListener(unused -> {
             FirebaseAuth.getInstance().signOut();
-            setBusy(false, readablePhoneVerificationError(error));
+            result.reject(error);
         });
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == GOOGLE_IDENTITY_SIGN_IN_REQUEST) {
+            if (resultCode != RESULT_OK || data == null) {
+                setBusy(false, "Google sign-in was cancelled.");
+                return;
+            }
+            try {
+                SignInCredential credential = Identity.getSignInClient(this)
+                        .getSignInCredentialFromIntent(data);
+                signInToFirebaseWithGoogleIdToken(credential.getGoogleIdToken());
+            } catch (ApiException error) {
+                Log.e(TAG, "Google Identity fallback did not return a valid credential. Status="
+                        + error.getStatusCode(), error);
+                setBusy(false, "Google could not authenticate that account ("
+                        + error.getStatusCode() + "). Reauthenticate it in Google Play and try again.");
+            }
+            return;
+        }
         if (requestCode != PICK_PROFILE_PHOTO_REQUEST || resultCode != RESULT_OK || data == null) {
             return;
         }
@@ -632,6 +672,9 @@ public class AuthActivity extends ComponentActivity {
                 "name@example.com",
                 InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
         );
+        resetEmailInput.setTextColor(color("#1C1C1E"));
+        resetEmailInput.setHintTextColor(color("#6B6B73"));
+        resetEmailInput.setBackground(rounded("#FFF7F7F8", dp(12), "#FFD0D0D5", 1));
         resetEmailInput.setText(clean(emailInput));
 
         LinearLayout dialogContent = new LinearLayout(this);
@@ -689,16 +732,27 @@ public class AuthActivity extends ComponentActivity {
     }
 
     private void signInWithGoogle() {
+        googleSignInFallbackAttempted = false;
+        requestGoogleCredential();
+    }
+
+    private void requestGoogleCredential() {
         if (!FirebaseCallRepository.isConfigured(this)) {
             setBusy(false, "Firebase is not configured.");
             return;
         }
 
+        String webClientId = getString(R.string.default_web_client_id).trim();
+        if (webClientId.isEmpty() || !webClientId.endsWith(".apps.googleusercontent.com")) {
+            Log.e(TAG, "Google sign-in blocked because default_web_client_id is invalid.");
+            setBusy(false, "Google sign-in is not configured correctly in this app build.");
+            return;
+        }
+
         setBusy(true, "Opening Google sign-in...");
         GetSignInWithGoogleOption googleIdOption = new GetSignInWithGoogleOption.Builder(
-                getString(R.string.default_web_client_id)
-        )
-                .build();
+                webClientId
+        ).build();
         GetCredentialRequest request = new GetCredentialRequest.Builder()
                 .addCredentialOption(googleIdOption)
                 .build();
@@ -716,15 +770,73 @@ public class AuthActivity extends ComponentActivity {
 
                     @Override
                     public void onError(GetCredentialException error) {
+                        Log.e(TAG, "Credential Manager failed before returning a Google ID token.", error);
+                        if (shouldUseGoogleIdFallback(error)) {
+                            googleSignInFallbackAttempted = true;
+                            setBusy(true, "Trying another Google sign-in method...");
+                            GoogleSignInState.clear(AuthActivity.this, () -> {
+                                if (!isFinishing() && !isDestroyed()) {
+                                    requestGoogleIdentityFallback();
+                                }
+                            });
+                            return;
+                        }
                         setBusy(false, readableGoogleError(error));
                     }
                 }
         );
     }
 
+    private boolean shouldUseGoogleIdFallback(GetCredentialException error) {
+        if (googleSignInFallbackAttempted || error == null) {
+            return false;
+        }
+        if (error instanceof NoCredentialException) {
+            return true;
+        }
+        String rawMessage = error.getMessage();
+        if (rawMessage == null) {
+            return false;
+        }
+        String message = rawMessage.toLowerCase(Locale.US);
+        return message.contains("account reauth failed") || message.contains("[16]");
+    }
+
+    private void requestGoogleIdentityFallback() {
+        String webClientId = getString(R.string.default_web_client_id).trim();
+        GetSignInIntentRequest request = GetSignInIntentRequest.builder()
+                .setServerClientId(webClientId)
+                .build();
+
+        setBusy(true, "Opening Google account selection...");
+        Identity.getSignInClient(this)
+                .getSignInIntent(request)
+                .addOnSuccessListener(pendingIntent -> {
+                    try {
+                        startIntentSenderForResult(
+                                pendingIntent.getIntentSender(),
+                                GOOGLE_IDENTITY_SIGN_IN_REQUEST,
+                                null,
+                                0,
+                                0,
+                                0
+                        );
+                    } catch (IntentSender.SendIntentException error) {
+                        Log.e(TAG, "Could not open the Google Identity fallback chooser.", error);
+                        setBusy(false, "Could not open Google account selection. Try again.");
+                    }
+                })
+                .addOnFailureListener(error -> {
+                    Log.e(TAG, "Google Identity fallback failed before opening its chooser.", error);
+                    setBusy(false, "Google account selection is unavailable on this device. "
+                            + "Update Google Play services and try again.");
+                });
+    }
+
     private void handleGoogleCredential(Credential credential) {
         if (!(credential instanceof CustomCredential)
                 || !GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL.equals(credential.getType())) {
+            Log.e(TAG, "Credential Manager returned unsupported credential type: " + credential.getType());
             setBusy(false, "Google returned an unsupported sign-in credential.");
             return;
         }
@@ -732,14 +844,27 @@ public class AuthActivity extends ComponentActivity {
         try {
             CustomCredential customCredential = (CustomCredential) credential;
             GoogleIdTokenCredential googleCredential = GoogleIdTokenCredential.createFrom(customCredential.getData());
-            AuthCredential firebaseCredential = GoogleAuthProvider.getCredential(googleCredential.getIdToken(), null);
-            FirebaseAuth.getInstance()
-                    .signInWithCredential(firebaseCredential)
-                    .addOnSuccessListener(result -> loadProfileAfterAuthentication())
-                    .addOnFailureListener(error -> setBusy(false, readableError(error)));
+            signInToFirebaseWithGoogleIdToken(googleCredential.getIdToken());
         } catch (RuntimeException error) {
+            Log.e(TAG, "Failed to parse the Google ID token response.", error);
             setBusy(false, "Google returned an invalid sign-in response. Update the app and try again.");
         }
+    }
+
+    private void signInToFirebaseWithGoogleIdToken(String idToken) {
+        if (idToken == null || idToken.trim().isEmpty()) {
+            setBusy(false, "Google did not return an identity token. Choose another account.");
+            return;
+        }
+        AuthCredential firebaseCredential = GoogleAuthProvider.getCredential(idToken, null);
+        FirebaseAuth.getInstance()
+                .signInWithCredential(firebaseCredential)
+                .addOnSuccessListener(result -> loadProfileAfterAuthentication())
+                .addOnFailureListener(error -> {
+                    Log.e(TAG, "Firebase rejected the Google ID token.", error);
+                    setBusy(false, "Google account selected, but Firebase sign-in failed. "
+                            + readableError(error));
+                });
     }
 
     private void loadProfileAfterAuthentication() {
@@ -756,6 +881,7 @@ public class AuthActivity extends ComponentActivity {
 
             @Override
             public void onFailure(Exception error) {
+                Log.e(TAG, "Google sign-in succeeded, but loading the EZ Call profile failed.", error);
                 setBusy(false, readableError(error));
             }
         });
@@ -801,12 +927,13 @@ public class AuthActivity extends ComponentActivity {
 
         beginPhoneVerification(
                 phoneNumber,
-                credential -> completeGoogleProfileAfterPhoneVerification(
+                (credential, result) -> completeGoogleProfileAfterPhoneVerification(
                         user,
                         displayName,
                         phoneNumber,
                         selectedPhotoBase64,
-                        credential
+                        credential,
+                        result
                 )
         );
     }
@@ -816,24 +943,22 @@ public class AuthActivity extends ComponentActivity {
             String displayName,
             String phoneNumber,
             String photoBase64,
-            PhoneAuthCredential credential
+            PhoneAuthCredential credential,
+            PhoneVerificationPrompt.Result result
     ) {
-        setBusy(true, "Saving your verified calling profile...");
         if (credential == null) {
+            result.accept();
+            setBusy(true, "Saving your verified calling profile...");
             saveGoogleProfile(user, displayName, phoneNumber, photoBase64);
             return;
         }
         user.linkWithCredential(credential)
-                .addOnSuccessListener(linked -> saveGoogleProfile(
-                        user,
-                        displayName,
-                        phoneNumber,
-                        photoBase64
-                ))
-                .addOnFailureListener(error -> setBusy(
-                        false,
-                        readablePhoneVerificationError(error)
-                ));
+                .addOnSuccessListener(linked -> {
+                    result.accept();
+                    setBusy(true, "Saving your verified calling profile...");
+                    saveGoogleProfile(user, displayName, phoneNumber, photoBase64);
+                })
+                .addOnFailureListener(result::reject);
     }
 
     private void saveGoogleProfile(
@@ -868,192 +993,37 @@ public class AuthActivity extends ComponentActivity {
     }
 
     private void beginPhoneVerification(String phoneNumber, PhoneVerifiedAction action) {
-        FirebaseUser currentUser = FirebaseAuth.getInstance().getCurrentUser();
-        if (currentUser != null
-                && FirebaseCallRepository.normalizePhoneNumber(phoneNumber).equals(
-                FirebaseCallRepository.normalizePhoneNumber(currentUser.getPhoneNumber())
-        )) {
-            action.onVerified(null);
-            return;
+        if (phoneVerificationPrompt != null) {
+            phoneVerificationPrompt.dismiss();
         }
-
-        phoneBeingVerified = phoneNumber;
-        phoneVerificationId = "";
-        phoneResendToken = null;
-        pendingPhoneVerifiedAction = action;
-        setBusy(true, "Sending a verification code to " + phoneNumber + "...");
-        sendPhoneVerificationCode(null);
-    }
-
-    private void sendPhoneVerificationCode(
-            PhoneAuthProvider.ForceResendingToken forceResendingToken
-    ) {
-        int generation = ++phoneVerificationGeneration;
-        PhoneAuthOptions.Builder options = PhoneAuthOptions.newBuilder(FirebaseAuth.getInstance())
-                .setPhoneNumber(phoneBeingVerified)
-                .setTimeout(60L, TimeUnit.SECONDS)
-                .setActivity(this)
-                .setCallbacks(new PhoneAuthProvider.OnVerificationStateChangedCallbacks() {
+        phoneVerificationPrompt = new PhoneVerificationPrompt(
+                this,
+                new PhoneVerificationPrompt.Callbacks() {
                     @Override
-                    public void onVerificationCompleted(PhoneAuthCredential credential) {
-                        if (generation == phoneVerificationGeneration) {
-                            completePhoneVerification(credential);
-                        }
-                    }
-
-                    @Override
-                    public void onVerificationFailed(FirebaseException error) {
-                        if (generation == phoneVerificationGeneration) {
-                            failPhoneVerification(error);
-                        }
-                    }
-
-                    @Override
-                    public void onCodeSent(
-                            String verificationId,
-                            PhoneAuthProvider.ForceResendingToken resendingToken
+                    public void onPhoneCredentialReady(
+                            PhoneAuthCredential credential,
+                            PhoneVerificationPrompt.Result result
                     ) {
-                        if (generation != phoneVerificationGeneration) {
-                            return;
-                        }
-                        phoneVerificationId = verificationId;
-                        phoneResendToken = resendingToken;
-                        showSmsCodeDialog();
+                        action.onVerified(credential, result);
                     }
-                });
-        if (forceResendingToken != null) {
-            options.setForceResendingToken(forceResendingToken);
-        }
-        PhoneAuthProvider.verifyPhoneNumber(options.build());
-    }
 
-    private void showSmsCodeDialog() {
-        setBusy(true, "Verification code sent to " + phoneBeingVerified + ".");
-        if (smsCodeDialog != null && smsCodeDialog.isShowing()) {
-            smsCodeDialog.setMessage("Enter the new 6-digit code sent to " + phoneBeingVerified + ".");
-            setSmsDialogBusy(false);
-            return;
-        }
+                    @Override
+                    public void onPhoneVerificationStatus(String message) {
+                        setBusy(true, message);
+                    }
 
-        smsCodeInput = input("6-digit code", InputType.TYPE_CLASS_NUMBER);
-        smsCodeInput.setFilters(new InputFilter[]{new InputFilter.LengthFilter(6)});
-        smsCodeInput.setGravity(Gravity.CENTER);
-        smsCodeInput.setTextColor(color("#FFFFFF"));
-        smsCodeInput.setHintTextColor(color("#777582"));
-        smsCodeInput.setBackground(rounded("#0F101C", dp(12), "#454451", 1));
+                    @Override
+                    public void onPhoneVerificationCancelled() {
+                        setBusy(false, "Phone verification cancelled.");
+                    }
 
-        LinearLayout dialogContent = new LinearLayout(this);
-        dialogContent.setOrientation(LinearLayout.VERTICAL);
-        dialogContent.setPadding(dp(22), dp(6), dp(22), 0);
-        dialogContent.addView(smsCodeInput, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(54)
-        ));
-
-        smsCodeDialog = new AlertDialog.Builder(this)
-                .setTitle("Verify phone number")
-                .setMessage("Enter the 6-digit code sent to " + phoneBeingVerified + ".")
-                .setView(dialogContent)
-                .setNegativeButton("Cancel", (dialog, which) -> cancelPhoneVerification())
-                .setNeutralButton("Resend", null)
-                .setPositiveButton("Verify", null)
-                .create();
-        smsCodeDialog.setOnCancelListener(dialog -> cancelPhoneVerification());
-        smsCodeDialog.setOnShowListener(unused -> {
-            smsCodeDialog.getButton(AlertDialog.BUTTON_POSITIVE)
-                    .setOnClickListener(view -> verifySmsCode());
-            smsCodeDialog.getButton(AlertDialog.BUTTON_NEUTRAL)
-                    .setOnClickListener(view -> resendSmsCode());
-            smsCodeInput.requestFocus();
-        });
-        smsCodeDialog.show();
-    }
-
-    private void verifySmsCode() {
-        String code = clean(smsCodeInput);
-        if (code.length() != 6) {
-            smsCodeInput.setError("Enter the 6-digit code.");
-            smsCodeInput.requestFocus();
-            return;
-        }
-        if (phoneVerificationId.isEmpty()) {
-            statusText.setText("Request a new verification code.");
-            return;
-        }
-        setSmsDialogBusy(true);
-        statusText.setText("Checking verification code...");
-        try {
-            completePhoneVerification(
-                    PhoneAuthProvider.getCredential(phoneVerificationId, code)
-            );
-        } catch (IllegalArgumentException error) {
-            setSmsDialogBusy(false);
-            smsCodeInput.setError("Enter the 6-digit code.");
-        }
-    }
-
-    private void resendSmsCode() {
-        if (phoneResendToken == null) {
-            statusText.setText("Wait for the current code, then try again.");
-            return;
-        }
-        setSmsDialogBusy(true);
-        smsCodeInput.setText("");
-        statusText.setText("Sending a new verification code...");
-        sendPhoneVerificationCode(phoneResendToken);
-    }
-
-    private void completePhoneVerification(PhoneAuthCredential credential) {
-        PhoneVerifiedAction action = pendingPhoneVerifiedAction;
-        if (action == null) {
-            return;
-        }
-        phoneVerificationGeneration++;
-        pendingPhoneVerifiedAction = null;
-        phoneVerificationId = "";
-        phoneResendToken = null;
-        if (smsCodeDialog != null) {
-            smsCodeDialog.dismiss();
-            smsCodeDialog = null;
-        }
-        smsCodeInput = null;
-        setBusy(true, "Phone number verified.");
-        action.onVerified(credential);
-    }
-
-    private void failPhoneVerification(Exception error) {
-        phoneVerificationGeneration++;
-        pendingPhoneVerifiedAction = null;
-        phoneVerificationId = "";
-        phoneResendToken = null;
-        if (smsCodeDialog != null) {
-            smsCodeDialog.dismiss();
-            smsCodeDialog = null;
-        }
-        smsCodeInput = null;
-        setBusy(false, readablePhoneVerificationError(error));
-    }
-
-    private void cancelPhoneVerification() {
-        phoneVerificationGeneration++;
-        pendingPhoneVerifiedAction = null;
-        phoneVerificationId = "";
-        phoneResendToken = null;
-        smsCodeDialog = null;
-        smsCodeInput = null;
-        setBusy(false, "Phone verification cancelled.");
-    }
-
-    private void setSmsDialogBusy(boolean busy) {
-        if (smsCodeDialog == null || !smsCodeDialog.isShowing()) {
-            return;
-        }
-        smsCodeDialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(!busy);
-        smsCodeDialog.getButton(AlertDialog.BUTTON_NEUTRAL).setEnabled(!busy);
-        smsCodeDialog.getButton(AlertDialog.BUTTON_NEGATIVE).setEnabled(!busy);
-        if (smsCodeInput != null) {
-            smsCodeInput.setEnabled(!busy);
-        }
+                    @Override
+                    public void onPhoneVerificationFailed(Exception error) {
+                        setBusy(false, readablePhoneVerificationError(error));
+                    }
+                }
+        );
+        phoneVerificationPrompt.start(phoneNumber);
     }
 
     private String readablePhoneVerificationError(Exception error) {
@@ -1117,11 +1087,12 @@ public class AuthActivity extends ComponentActivity {
         if (error == null) {
             return "Google sign-in did not complete. Try again.";
         }
+        String errorType = error.getClass().getSimpleName();
         String message = error.getMessage();
         if (message == null || message.trim().isEmpty()) {
-            return "Google sign-in was cancelled or no Google account is available.";
+            return "Google sign-in failed before Firebase (" + errorType + ").";
         }
-        return "Google sign-in failed. " + message;
+        return "Google sign-in failed before Firebase (" + errorType + "). " + message;
     }
 
     private boolean isEmail(String email) {
@@ -1394,7 +1365,11 @@ public class AuthActivity extends ComponentActivity {
     }
 
     private interface PhoneVerifiedAction {
-        void onVerified(PhoneAuthCredential credential);
+        /**
+         * Proves {@code credential} against Firebase, then reports the outcome through
+         * {@code result} so a wrong code can be retyped instead of restarting sign-up.
+         */
+        void onVerified(PhoneAuthCredential credential, PhoneVerificationPrompt.Result result);
     }
 
     private static final class PendingEmailRegistration {

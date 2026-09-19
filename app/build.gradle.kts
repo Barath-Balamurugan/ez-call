@@ -20,8 +20,8 @@ android {
         applicationId = "com.ezcall.onetoone"
         minSdk = 26
         targetSdk = 36
-        versionCode = 94
-        versionName = "1.94"
+        versionCode = 102
+        versionName = "2.02"
 
         if (!hasGoogleServices) {
             resValue("string", "default_web_client_id", "")
@@ -38,9 +38,10 @@ dependencies {
     implementation("com.google.firebase:firebase-firestore")
     implementation("com.google.firebase:firebase-messaging")
     implementation("com.google.firebase:firebase-functions")
-    implementation("androidx.credentials:credentials:1.3.0")
-    implementation("androidx.credentials:credentials-play-services-auth:1.3.0")
-    implementation("com.google.android.libraries.identity.googleid:googleid:1.1.1")
+    implementation("androidx.credentials:credentials:1.6.0")
+    implementation("androidx.credentials:credentials-play-services-auth:1.6.0")
+    implementation("com.google.android.libraries.identity.googleid:googleid:1.2.0")
+    implementation("com.google.android.gms:play-services-auth:21.1.1")
     implementation("io.michaelrocks:libphonenumber-android:9.0.34")
     implementation("io.getstream:stream-webrtc-android:1.3.10")
     testImplementation("junit:junit:4.13.2")

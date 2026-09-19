@@ -52,6 +52,7 @@ import com.google.firebase.firestore.ListenerRegistration;
 import org.webrtc.SurfaceViewRenderer;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 public class VideoCallActivity extends ComponentActivity {
@@ -79,6 +80,7 @@ public class VideoCallActivity extends ComponentActivity {
     private boolean incomingCall;
     private boolean outgoingInviteSent;
     private boolean webRtcStarted;
+    private boolean webRtcStarting;
     private boolean cameraEnabled = true;
     private boolean cameraSuspendedForScreenOff;
     private boolean screenStateReceiverRegistered;
@@ -1420,7 +1422,53 @@ public class VideoCallActivity extends ComponentActivity {
             View remoteCameraOffOverlay,
             AudioReactiveAvatar audioAvatar
     ) {
-        if (webRtcStarted) {
+        if (webRtcStarted || webRtcStarting) {
+            return;
+        }
+        webRtcStarting = true;
+        final boolean[] iceServerRequestResolved = {false};
+        Runnable startWithStun = () -> {
+            if (iceServerRequestResolved[0]) {
+                return;
+            }
+            iceServerRequestResolved[0] = true;
+            webRtcStarting = false;
+            startWebRtc(
+                    remoteRenderer,
+                    localRenderer,
+                    remoteCameraOffOverlay,
+                    audioAvatar,
+                    Collections.emptyList()
+            );
+        };
+        // Existing installations may not have the new callable deployed yet.
+        // Do not let its lookup delay a normally reachable direct call.
+        uiHandler.postDelayed(startWithStun, 2_000L);
+        FirebaseCallRepository.fetchTurnIceServers(this, iceServers -> {
+            if (iceServerRequestResolved[0]) {
+                return;
+            }
+            iceServerRequestResolved[0] = true;
+            uiHandler.removeCallbacks(startWithStun);
+            webRtcStarting = false;
+            startWebRtc(
+                    remoteRenderer,
+                    localRenderer,
+                    remoteCameraOffOverlay,
+                    audioAvatar,
+                    iceServers
+            );
+        });
+    }
+
+    private void startWebRtc(
+            SurfaceViewRenderer remoteRenderer,
+            SurfaceViewRenderer localRenderer,
+            View remoteCameraOffOverlay,
+            AudioReactiveAvatar audioAvatar,
+            List<FirebaseCallRepository.IceServerConfiguration> iceServers
+    ) {
+        if (webRtcStarted || finalStatusWritten || isFinishing() || isDestroyed()) {
             return;
         }
         try {
@@ -1450,7 +1498,15 @@ public class VideoCallActivity extends ComponentActivity {
                         public void onReconnectFailed() {
                             handleWebRtcReconnectFailure();
                         }
-                    }
+
+                        @Override
+                        public void onInitialConnectionFailed() {
+                            handleWebRtcConnectionFailure(
+                                    "Audio and video could not connect. Try another Wi-Fi or mobile network and call again."
+                            );
+                        }
+                    },
+                    iceServers
             );
             webRtcCallClient.start();
             EzCallTelecomManager.setActive(callId);
@@ -1518,6 +1574,10 @@ public class VideoCallActivity extends ComponentActivity {
     }
 
     private void handleWebRtcReconnectFailure() {
+        handleWebRtcConnectionFailure("The connection could not be restored. Check your network and call again.");
+    }
+
+    private void handleWebRtcConnectionFailure(String message) {
         if (finalStatusWritten || callClosureInProgress || isFinishing() || isDestroyed()) {
             return;
         }
@@ -1527,7 +1587,7 @@ public class VideoCallActivity extends ComponentActivity {
         CallForegroundService.stop(this);
         EzCallTelecomManager.disconnect(callId, DisconnectCause.ERROR);
         FirebaseCallRepository.markCallInviteStatus(this, callId, "ended");
-        showCallError("The connection could not be restored. Check your network and call again.");
+        showCallError(message);
     }
 
     private void applyCameraEnabledState() {

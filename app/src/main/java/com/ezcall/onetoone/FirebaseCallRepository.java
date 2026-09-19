@@ -10,6 +10,7 @@ import com.google.firebase.Timestamp;
 import com.google.firebase.FirebaseApp;
 import com.google.firebase.auth.FirebaseAuth;
 import com.google.firebase.auth.FirebaseUser;
+import com.google.firebase.auth.UserInfo;
 import com.google.firebase.firestore.DocumentSnapshot;
 import com.google.firebase.firestore.DocumentReference;
 import com.google.firebase.firestore.FieldValue;
@@ -64,6 +65,23 @@ final class FirebaseCallRepository {
                     .set(data, SetOptions.merge())
                     .addOnFailureListener(error -> Log.e(TAG, "Failed to register FCM token", error));
         }).addOnFailureListener(error -> Log.e(TAG, "Failed to fetch FCM token", error));
+    }
+
+    static void fetchTurnIceServers(Context context, IceServerLoadListener listener) {
+        if (!isConfigured(context) || FirebaseAuth.getInstance().getCurrentUser() == null) {
+            listener.onIceServersLoaded(Collections.emptyList());
+            return;
+        }
+        FirebaseFunctions.getInstance()
+                .getHttpsCallable("getIceServers")
+                .call()
+                .addOnSuccessListener(result -> listener.onIceServersLoaded(
+                        iceServersFromCallableResult(result.getData())
+                ))
+                .addOnFailureListener(error -> {
+                    Log.i(TAG, "TURN relay credentials unavailable; using STUN only.", error);
+                    listener.onIceServersLoaded(Collections.emptyList());
+                });
     }
 
     static boolean isConfigured(Context context) {
@@ -135,14 +153,20 @@ final class FirebaseCallRepository {
     }
 
     static String currentEmailOrEmpty(Context context) {
-        String cachedEmail = prefs(context).getString(KEY_LOCAL_EMAIL, "");
-        if (!cachedEmail.isEmpty()) {
-            return cachedEmail;
+        FirebaseUser user = isConfigured(context) ? FirebaseAuth.getInstance().getCurrentUser() : null;
+        return authenticatedEmail(user);
+    }
+
+    private static String authenticatedEmail(FirebaseUser user) {
+        if (user == null) {
+            return "";
         }
-        if (isConfigured(context)) {
-            FirebaseUser user = FirebaseAuth.getInstance().getCurrentUser();
-            if (user != null && user.getEmail() != null) {
-                return user.getEmail();
+        if (user.getEmail() != null && !user.getEmail().trim().isEmpty()) {
+            return user.getEmail().trim();
+        }
+        for (UserInfo provider : user.getProviderData()) {
+            if (provider.getEmail() != null && !provider.getEmail().trim().isEmpty()) {
+                return provider.getEmail().trim();
             }
         }
         return "";
@@ -187,7 +211,7 @@ final class FirebaseCallRepository {
                 ? currentUser == null ? "" : currentUser.getUid()
                 : uid.trim();
         String resolvedEmail = email == null || email.trim().isEmpty()
-                ? currentUser == null ? "" : valueOrDefault(currentUser.getEmail(), "")
+                ? authenticatedEmail(currentUser)
                 : email.trim();
         String resolvedPhotoBase64 = ProfilePhotoUtils.sanitizeBase64(photoBase64);
 
@@ -270,7 +294,7 @@ final class FirebaseCallRepository {
         }
 
         String oldNormalizedPhoneNumber = normalizePhoneNumber(currentPhoneNumberOrFallback(context));
-        String email = currentUser.getEmail() == null ? currentEmailOrEmpty(context) : currentUser.getEmail();
+        String email = authenticatedEmail(currentUser);
         String resolvedPhotoBase64 = ProfilePhotoUtils.sanitizeBase64(photoBase64);
 
         Map<String, Object> data = new HashMap<>();
@@ -284,7 +308,11 @@ final class FirebaseCallRepository {
         FirebaseFirestore db = FirebaseFirestore.getInstance();
         DocumentReference profileReference = db.collection("users")
                 .document(normalizedPhoneNumber);
-        profileReference.get()
+        // Creating users/{phone} requires request.auth.token.phone_number to match. After a
+        // phone-number change the cached ID token still carries the old claim, so force a
+        // refresh before writing or Firestore rejects the create.
+        currentUser.getIdToken(true).addOnCompleteListener(tokenRefresh ->
+                profileReference.get()
                 .addOnSuccessListener(existingProfile -> {
                     if (PhoneProfileOwnership.belongsToDifferentUser(
                             existingProfile.exists(),
@@ -327,7 +355,7 @@ final class FirebaseCallRepository {
                                     listener
                             ));
                 })
-                .addOnFailureListener(listener::onFailure);
+                .addOnFailureListener(listener::onFailure));
     }
 
     private static void reportProfileWriteFailure(
@@ -373,7 +401,18 @@ final class FirebaseCallRepository {
                         listener.onMissingProfile();
                         return;
                     }
-                    UserProfile profile = profileFromDocument(snapshot.getDocuments().get(0));
+                    FirebaseUser signedInUser = FirebaseAuth.getInstance().getCurrentUser();
+                    if (signedInUser == null || !signedInUser.getUid().equals(currentUser.getUid())) {
+                        listener.onFailure(new IllegalStateException("Your signed-in account changed. Reopen your profile."));
+                        return;
+                    }
+                    UserProfile storedProfile = profileFromDocument(snapshot.getDocuments().get(0));
+                    // Public calling profiles intentionally do not store login email.
+                    UserProfile profile = new UserProfile(
+                            storedProfile.uid, storedProfile.displayName, authenticatedEmail(signedInUser),
+                            storedProfile.phoneNumber, storedProfile.normalizedPhoneNumber,
+                            storedProfile.photoBase64, storedProfile.hiddenFromContacts
+                    );
                     if (profile.phoneNumber.isEmpty()) {
                         listener.onMissingProfile();
                         return;
@@ -750,6 +789,41 @@ final class FirebaseCallRepository {
         return phoneNumber.replaceAll("[^0-9]", "");
     }
 
+    private static List<IceServerConfiguration> iceServersFromCallableResult(Object resultData) {
+        if (!(resultData instanceof Map)) {
+            return Collections.emptyList();
+        }
+        Object values = ((Map<?, ?>) resultData).get("iceServers");
+        if (!(values instanceof List)) {
+            return Collections.emptyList();
+        }
+
+        List<IceServerConfiguration> servers = new ArrayList<>();
+        for (Object value : (List<?>) values) {
+            if (!(value instanceof Map)) {
+                continue;
+            }
+            Map<?, ?> server = (Map<?, ?>) value;
+            Object urlsValue = server.get("urls");
+            if (!(urlsValue instanceof List)) {
+                continue;
+            }
+            List<String> urls = new ArrayList<>();
+            for (Object urlValue : (List<?>) urlsValue) {
+                String url = valueOrDefault(urlValue, "").trim();
+                if (url.matches("(?i)^turns?:.+") && url.length() <= 500) {
+                    urls.add(url);
+                }
+            }
+            String username = valueOrDefault(server.get("username"), "").trim();
+            String credential = valueOrDefault(server.get("credential"), "").trim();
+            if (!urls.isEmpty() && !username.isEmpty() && !credential.isEmpty()) {
+                servers.add(new IceServerConfiguration(urls, username, credential));
+            }
+        }
+        return servers;
+    }
+
     private static String localPhoneNumber(Context context) {
         return prefs(context).getString(KEY_LOCAL_PHONE_NUMBER, "");
     }
@@ -938,6 +1012,10 @@ final class FirebaseCallRepository {
         void onFailure(Exception error);
     }
 
+    interface IceServerLoadListener {
+        void onIceServersLoaded(List<IceServerConfiguration> iceServers);
+    }
+
     interface ProfileLoadListener {
         void onProfileLoaded(UserProfile profile);
 
@@ -975,6 +1053,18 @@ final class FirebaseCallRepository {
             this.normalizedPhoneNumber = normalizedPhoneNumber;
             this.photoBase64 = photoBase64;
             this.hiddenFromContacts = hiddenFromContacts;
+        }
+    }
+
+    static final class IceServerConfiguration {
+        final List<String> urls;
+        final String username;
+        final String credential;
+
+        IceServerConfiguration(List<String> urls, String username, String credential) {
+            this.urls = new ArrayList<>(urls);
+            this.username = username;
+            this.credential = credential;
         }
     }
 

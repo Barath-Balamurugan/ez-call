@@ -204,7 +204,7 @@ public class MainActivity extends Activity {
                 0
         ));
 
-        TextView title = text("EZ Calls", 42, "#FFFFFF", Typeface.BOLD);
+        TextView title = text("EZ Call", 42, "#FFFFFF", Typeface.BOLD);
         topRow.addView(title, new LinearLayout.LayoutParams(
                 0,
                 ViewGroup.LayoutParams.WRAP_CONTENT
